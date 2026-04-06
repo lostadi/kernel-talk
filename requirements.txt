@@ -1,0 +1,26 @@
+# ─── Core: The Mirror ─────────────────────────────────────────────────────────
+tree-sitter>=0.22.0          # AST parsing framework
+tree-sitter-c>=0.21.0        # C grammar for tree-sitter
+sentence-transformers>=2.7.0 # CodeBERT and other embedding models
+chromadb>=0.5.0              # Local vector database (no server)
+networkx>=3.3                # Knowledge graph
+
+# ─── ML Runtime ───────────────────────────────────────────────────────────────
+torch>=2.0.0                 # Required by sentence-transformers
+transformers>=4.40.0         # HuggingFace model hub
+
+# ─── Numerical ────────────────────────────────────────────────────────────────
+numpy>=1.24.0
+
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+click>=8.1.0                 # Command structure
+rich>=13.7.0                 # Terminal formatting
+
+# ─── The Probe (Linux only, optional) ─────────────────────────────────────────
+# drgn                       # Live kernel memory (pip install drgn, Linux only)
+#                            # Uncomment on Linux. Requires /proc/kcore + root.
+
+# ─── LLM Backends (install whichever you use) ─────────────────────────────────
+# ollama                     # Local LLM via Ollama (recommended)
+# openai                     # OpenAI or OpenAI-compatible APIs
+# anthropic                  # Anthropic Claude API
