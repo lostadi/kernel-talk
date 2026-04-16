@@ -1,23 +1,36 @@
 """
 tools/xray.py
 ──────────────
-Filesystem X-Ray
+Filesystem X-Ray  +  addr2line
 
-The crown jewel of Kernel-Talk's UX.
+Two capabilities in one module — both are about tracing a runtime observable
+back to ground-truth source code.
+
+─── Filesystem X-Ray ─────────────────────────────────────────────────────────
 
 A user sees `/sys/class/net/wlan0/operstate` and gets back:
   "This attribute is served by net/core/net-sysfs.c, function operstate_show().
    It reads net_device.operstate, a u8 field that maps to the IF_OPER_* enum
    defined in include/uapi/linux/if.h. Currently the value is 'up' (4)."
 
-That's the Logos/Eros synthesis in action — static source mapping fused
-with live drgn state.
+Four-stage pipeline (upgraded from three):
+  1. Pattern Matching — curated map for common /sys and /proc paths
+  2. Vector Search    — semantic query over Mirror for unknown paths
+  3. DWARF Lookup     — if DWARF is loaded, find the handler's exact binary addr
+  4. Live Read        — actual current value from the filesystem + live struct decode
 
-The X-Ray works in three stages:
-  1. Pattern Matching — known /sys and /proc paths have predictable source locations.
-     We maintain a hand-curated map of the most common ones.
-  2. Vector Search — for unknown paths, we construct a semantic query and
-     search the Mirror for likely handlers (show_*, read_*, store_* functions).
+─── addr2line ────────────────────────────────────────────────────────────────
+
+Given any virtual address (e.g. from a stack trace, a perf sample, an oops):
+  addr2line(0xffffffff811abc04) →
+    "kernel/sched/core.c:5234 [schedule()+0x4], compiled from schedule() in
+     kernel/sched/core.c:5230, binary range 0xffffffff811abc00–0xffffffff811ac000"
+
+This is the full Digital Twin traversal in reverse:
+  live address → KASLR slide → DWARF address → source line + function
+
+Uses DwarfBridge (Layer 2) and KallsymsBridge (Layer 3).
+"""
   3. Live Probe (optional) — if drgn is available, read the actual current value.
 """
 
@@ -30,6 +43,64 @@ from typing import Any
 
 from core.mirror.store import KernelStore, HybridResult
 from core.probe.drgn_bridge import DrgnBridge, LiveSnapshot
+from core.probe.kallsyms import KallsymsBridge
+
+
+# ─── addr2line Result ─────────────────────────────────────────────────────────
+
+@dataclass
+class Addr2LineResult:
+    """
+    The output of an addr2line query.
+
+    Maps a raw virtual address (from a stack trace, oops, or perf sample)
+    back through all four Digital Twin layers to a human-readable source ref.
+    """
+    address: int
+    address_hex: str
+
+    # Layer 3 result (kallsyms)
+    kallsym_name: str | None          # Nearest symbol from /proc/kallsyms
+    kallsym_offset: int               # Offset within that symbol
+
+    # Layer 2 result (DWARF function)
+    function_name: str | None         # Function containing this address
+    function_range: str | None        # "0xaddr_start – 0xaddr_end"
+    dwarf_source_file: str | None     # Source file from DWARF DW_AT_decl_file
+    dwarf_source_line: int | None     # Source line from DWARF DW_AT_decl_line
+
+    # Layer 2 result (DWARF line program — most precise)
+    line_source_file: str | None      # Source file from line number program
+    line_source_line: int | None      # Line from line number program
+    line_is_stmt: bool = False        # Is this a statement boundary?
+
+    # Layer 1 result (graph — connected CodeNode if Mirror is loaded)
+    code_node_id: str | None = None   # ID of the matching CodeNode in the graph
+
+    def pretty(self) -> str:
+        lines = [f"addr2line: {self.address_hex}"]
+
+        # Best source ref is line program > DWARF function > kallsym
+        if self.line_source_file and self.line_source_line:
+            stmt = " [stmt]" if self.line_is_stmt else ""
+            lines.append(f"  Source:   {self.line_source_file}:{self.line_source_line}{stmt}")
+
+        if self.function_name:
+            offset = self.address - int(self.function_range.split("–")[0], 16) \
+                     if self.function_range else self.kallsym_offset
+            lines.append(f"  Function: {self.function_name}()+0x{offset:x}")
+            if self.function_range:
+                lines.append(f"  Range:    {self.function_range}")
+            if self.dwarf_source_file and self.dwarf_source_line:
+                lines.append(f"  Decl:     {self.dwarf_source_file}:{self.dwarf_source_line}")
+
+        if self.kallsym_name:
+            lines.append(f"  Symbol:   {self.kallsym_name}+0x{self.kallsym_offset:x} (kallsyms)")
+
+        if self.code_node_id:
+            lines.append(f"  Mirror:   {self.code_node_id}")
+
+        return "\n".join(lines)
 
 
 # ─── Result ───────────────────────────────────────────────────────────────────
@@ -222,15 +293,19 @@ class XRay:
         self,
         store: KernelStore | None = None,
         probe: DrgnBridge | None = None,
+        dwarf=None,              # DwarfBridge | None — for addr2line and binary enrichment
+        kallsyms=None,           # KallsymsBridge | None — for live address resolution
     ):
         """
-        store: KernelStore for vector-backed fallback lookup.
-               If None, only pattern matching is used.
-        probe: DrgnBridge for live value reading.
-               If None, live values are not fetched.
+        store:    KernelStore for vector-backed fallback lookup.
+        probe:    DrgnBridge for live value reading.
+        dwarf:    DwarfBridge for addr2line and binary address enrichment.
+        kallsyms: KallsymsBridge for /proc/kallsyms live symbol resolution.
         """
-        self.store = store
-        self.probe = probe
+        self.store    = store
+        self.probe    = probe
+        self.dwarf    = dwarf
+        self.kallsyms = kallsyms
 
     def scan(self, path: str) -> XRayResult:
         """
@@ -348,3 +423,137 @@ class XRay:
     def list_known_patterns(self) -> list[str]:
         """Return all path patterns in the knowledge base."""
         return [pattern for pattern, _ in KNOWN_PATHS]
+
+    # ── addr2line ─────────────────────────────────────────────────────────────
+
+    def addr2line(self, address: int | str) -> Addr2LineResult:
+        """
+        Map a virtual kernel address back to its C source line.
+
+        This is the full Digital Twin traversal in reverse:
+          live address
+          → KASLR-adjusted via kallsyms
+          → DWARF function symbol (which function contains this address?)
+          → DWARF line program (which exact source line compiled to this address?)
+          → Mirror CodeNode (what do we know about this function statically?)
+
+        address: int (raw) or hex string "0xffffffff811abc04" or "ffffffff811abc04"
+
+        Requires: DwarfBridge loaded (DWARF analysis) and/or
+                  KallsymsBridge loaded (live symbol resolution).
+        At minimum, one of them must be present for useful results.
+        """
+        # Normalize address
+        if isinstance(address, str):
+            address = int(address.strip(), 16)
+
+        addr_hex = f"0x{address:016x}"
+
+        # Layer 3: kallsyms nearest-symbol
+        ks_name    = None
+        ks_offset  = 0
+        if self.kallsyms and self.kallsyms._loaded:
+            entry = self.kallsyms.nearest_symbol(address)
+            if entry and entry.address > 0:
+                ks_name   = entry.name
+                ks_offset = address - entry.address
+
+        # Determine the DWARF address to look up.
+        # If we have both kallsyms and DWARF, compute KASLR slide to de-randomize.
+        dwarf_addr = address
+        if self.kallsyms and self.dwarf and self.kallsyms._loaded:
+            slide = self.kallsyms.kaslr_slide(self.dwarf)
+            if slide is not None:
+                dwarf_addr = address - slide
+
+        # Layer 2a: DWARF function symbol
+        fn_name   = None
+        fn_range  = None
+        fn_src_file = None
+        fn_src_line = None
+
+        if self.dwarf and self.dwarf._loaded:
+            sym = self.dwarf.addr_to_symbol(dwarf_addr)
+            if sym:
+                fn_name     = sym.name
+                fn_range    = f"{sym.addr_start_hex} – {sym.addr_end_hex}"
+                fn_src_file = sym.source_file
+                fn_src_line = sym.source_line
+
+        # Layer 2b: DWARF line number program (most precise)
+        line_src_file = None
+        line_src_line = None
+        line_is_stmt  = False
+
+        if self.dwarf and self.dwarf._loaded:
+            line_entry = self.dwarf.addr_to_line(dwarf_addr)
+            if line_entry:
+                line_src_file = line_entry.file_path
+                line_src_line = line_entry.line
+                line_is_stmt  = line_entry.is_stmt
+
+        # Layer 1: Mirror CodeNode lookup (by function name from DWARF)
+        code_node_id = None
+        if self.store and fn_name:
+            nodes = self.store.graph.find_by_symbol(fn_name)
+            if nodes:
+                code_node_id = nodes[0].id
+
+        return Addr2LineResult(
+            address=address,
+            address_hex=addr_hex,
+            kallsym_name=ks_name,
+            kallsym_offset=ks_offset,
+            function_name=fn_name,
+            function_range=fn_range,
+            dwarf_source_file=fn_src_file,
+            dwarf_source_line=fn_src_line,
+            line_source_file=line_src_file,
+            line_source_line=line_src_line,
+            line_is_stmt=line_is_stmt,
+            code_node_id=code_node_id,
+        )
+
+    def decode_struct(
+        self,
+        struct_name: str,
+        raw_bytes: bytes,
+        endian: str = "little",
+    ) -> dict[str, Any] | None:
+        """
+        Decode raw kernel memory bytes into named struct fields using DWARF layout.
+
+        Given a pointer address and a read of sizeof(struct_name) bytes from
+        /proc/kcore, returns {field_name: integer_value} for all integer/pointer fields.
+
+        Example:
+            raw = kcore_read(task_ptr, layout.total_size)
+            fields = xray.decode_struct("task_struct", raw)
+            print(f"pid={fields['pid']}, state={fields['__state']}")
+
+        Requires DWARF to be loaded.
+        """
+        if not self.dwarf or not self.dwarf._loaded:
+            return None
+
+        layout = self.dwarf.struct_layout(struct_name)
+        if not layout:
+            return None
+
+        return layout.decode_bytes(raw_bytes, endian=endian)
+
+    def stack_trace_to_source(
+        self,
+        addresses: list[int | str],
+    ) -> list[Addr2LineResult]:
+        """
+        Map an entire stack trace (list of addresses) to source references.
+        Useful for decoding kernel oops, perf call stacks, or drgn stack traces.
+
+        Example:
+            stack = [0xffffffff811abc04, 0xffffffff81200018, ...]
+            frames = xray.stack_trace_to_source(stack)
+            for f in frames:
+                print(f.pretty())
+        """
+        return [self.addr2line(addr) for addr in addresses]

@@ -139,7 +139,9 @@ sudo pacman -S --needed python python-pip git base-devel
 #### Fedora / RHEL / AlmaLinux / Rocky Linux (dnf)
 
 ```bash
-sudo dnf install -y python3 python3-pip git gcc make
+sudo dnf install -y python3 python3-pip python3-devel git gcc make
+# python3-devel is required — several pip deps (tokenizers, chromadb)
+# compile C/Rust extensions and need Python.h
 ```
 
 ---
@@ -157,7 +159,15 @@ sudo zypper install -y python3 python3-pip git gcc make
 
 ```bash
 sudo emerge --sync
-sudo emerge -av dev-lang/python dev-python/pip dev-vcs/git sys-devel/gcc sys-devel/make
+
+# Set Python targets BEFORE emerging — Portage will reject packages
+# for undeclared targets. Add to /etc/portage/make.conf:
+echo 'PYTHON_TARGETS="python3_12"' | sudo tee -a /etc/portage/make.conf
+echo 'PYTHON_SINGLE_TARGET="python3_12"' | sudo tee -a /etc/portage/make.conf
+# Adjust python3_12 to whichever ≥ python3_10 your system supports.
+
+sudo emerge -av dev-lang/python:3.12 dev-python/pip dev-vcs/git \
+               sys-devel/gcc sys-devel/make dev-python/setuptools
 ```
 
 Ensure Python 3.10+ is selected as the active interpreter:
@@ -259,25 +269,50 @@ pip install drgn
 
 > Skip this section if you only want static analysis (`ktalk index` / `ktalk ask`).
 
-##### Ubuntu / Debian
+##### Ubuntu
 
 ```bash
-# Add the debug symbol repository
+# 1. Install the keyring FIRST (it lives in the standard ubuntu repos)
+sudo apt install -y ubuntu-dbgsym-keyring
+
+# 2. Add the ddebs source — now apt trusts the repo
 echo "deb http://ddebs.ubuntu.com $(lsb_release -cs) main restricted universe multiverse
 deb http://ddebs.ubuntu.com $(lsb_release -cs)-updates main restricted universe multiverse" \
   | sudo tee /etc/apt/sources.list.d/ddebs.list
 
-sudo apt install ubuntu-dbgsym-keyring
+# 3. Update and install debug symbols for the running kernel
 sudo apt update
 sudo apt install -y linux-image-$(uname -r)-dbgsym
+# vmlinux lives at: /usr/lib/debug/boot/vmlinux-$(uname -r)
+```
+
+##### Debian
+
+```bash
+# Debian ships debug symbols via a separate mirror
+echo "deb http://debug.mirrors.debian.org/debian-debug/ $(lsb_release -cs)-debug main" \
+  | sudo tee /etc/apt/sources.list.d/debian-debug.list
+sudo apt update
+sudo apt install -y linux-image-$(uname -r)-dbg
+# vmlinux lives at: /usr/lib/debug/boot/vmlinux-$(uname -r)
 ```
 
 ##### Arch Linux
 
+`linux-headers` only ships header files for module building — it does **not** contain DWARF debug info. Use one of these instead:
+
 ```bash
-# vmlinux with debug info is in the linux-headers package
-sudo pacman -S linux-headers
-# vmlinux lives at: /usr/lib/modules/$(uname -r)/build/vmlinux
+# Option A — debuginfod (easiest, no extra packages, fetches on demand)
+export DEBUGINFOD_URLS="https://debuginfod.archlinux.org"
+# drgn picks this up automatically. Add to ~/.bashrc / ~/.zshrc to persist.
+
+# Option B — recompile your kernel with debug info
+# In your kernel .config: CONFIG_DEBUG_INFO=y
+# Then rebuild and install. vmlinux is at /usr/src/linux/vmlinux after build.
+
+# Option C — AUR package with debug kernel
+# yay -S linux-debug   (or paru -S linux-debug)
+# vmlinux lives at: /usr/lib/modules/$(uname -r)-debug/vmlinux
 ```
 
 ##### Fedora / RHEL
@@ -327,9 +362,13 @@ sudo tar -xf /usr/src/linux-source-*.tar.bz2 -C /usr/src/
 ##### Arch Linux
 
 ```bash
-sudo pacman -S asp
-asp export linux
+# Modern Arch (devtools ≥ 1.0) — use pkgctl
+sudo pacman -S devtools
+pkgctl repo clone linux
 # Source tree is in ./linux/
+
+# Older Arch — use asp (if available)
+# sudo pacman -S asp && asp export linux
 ```
 
 ##### Fedora

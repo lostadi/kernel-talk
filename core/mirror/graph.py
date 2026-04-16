@@ -12,11 +12,26 @@ who calls whom, which functions touch which data structures, which files
 include which headers. This is the relational skeleton that vector search
 can't capture.
 
-Node types:  function | struct | union | enum | macro | file
-Edge types:  CALLS | USES_STRUCT | DEFINED_IN | INCLUDES | RELATED_TO
+The graph spans ALL FOUR LAYERS of the Digital Twin stack:
 
-The graph is a MultiDiGraph (directed, multiple edges allowed between same nodes)
-because a function can CALL another AND USE_STRUCT the same type simultaneously.
+  Layer 1  Source   node_type: function | struct | union | enum | macro | file
+  Layer 2  Binary   node_type: binary_symbol
+  Layer 3  Symbol   node_type: kallsym (live address from /proc/kallsyms)
+  Layer 4  Memory   (live snapshots are not graph nodes — they're query results)
+
+Edge types across layers:
+  Within source:    CALLS | USES_STRUCT | DEFINED_IN | INCLUDES
+  Source→Binary:    SOURCE_TO_BINARY  (C function → compiled address range)
+  Binary→Symbol:    BINARY_TO_LIVE    (DWARF addr → KASLR-adjusted live addr)
+  Source→Offset:    FIELD_TO_OFFSET   (struct field → byte offset in memory)
+
+This gives us the full traversal path for any query:
+  Vector hit (source) → SOURCE_TO_BINARY → binary addr
+                      → BINARY_TO_LIVE   → live virtual addr
+                      → /proc/kcore read → actual bytes
+                      → FIELD_TO_OFFSET  → decoded field values
+
+The graph is a MultiDiGraph (directed, multiple edges allowed between same nodes).
 """
 
 from __future__ import annotations
@@ -33,11 +48,30 @@ from .parser import CodeNode
 # ─── Edge Types (typed constants, not magic strings) ──────────────────────────
 
 class EdgeType:
-    CALLS        = "CALLS"         # function → function
-    USES_STRUCT  = "USES_STRUCT"   # function → struct/union
-    DEFINED_IN   = "DEFINED_IN"    # symbol → file
-    INCLUDES     = "INCLUDES"      # file → file (header graph)
-    RELATED_TO   = "RELATED_TO"    # soft co-occurrence edge (added at query time)
+    # ── Layer 1: Source graph ──────────────────────────────────────────────
+    CALLS        = "CALLS"           # function → function
+    USES_STRUCT  = "USES_STRUCT"     # function → struct/union
+    DEFINED_IN   = "DEFINED_IN"      # symbol → file
+    INCLUDES     = "INCLUDES"        # file → file (header graph)
+    RELATED_TO   = "RELATED_TO"      # soft co-occurrence edge (at query time)
+
+    # ── Layer 1→2: Source to Binary ───────────────────────────────────────
+    SOURCE_TO_BINARY = "SOURCE_TO_BINARY"
+    # C source node → compiled BinarySymbol node
+    # Edge carries: dwarf_addr_start, dwarf_addr_end, section
+    # Created by: link_dwarf(dwarf_bridge)
+
+    # ── Layer 2→3: Binary to Live ─────────────────────────────────────────
+    BINARY_TO_LIVE = "BINARY_TO_LIVE"
+    # BinarySymbol node → KallsymNode (live address)
+    # Edge carries: kaslr_slide, live_addr
+    # Created by: link_kallsyms(kallsyms_bridge, dwarf_bridge)
+
+    # ── Layer 1: Struct layout ────────────────────────────────────────────
+    FIELD_TO_OFFSET = "FIELD_TO_OFFSET"
+    # struct CodeNode → field CodeNode (or synthetic field node)
+    # Edge carries: byte_offset, byte_size, c_type
+    # Created by: link_struct_layouts(dwarf_bridge)
 
 
 # ─── Query Result ─────────────────────────────────────────────────────────────
@@ -339,6 +373,233 @@ class KernelGraph:
         for u, v, edge_attrs in loaded.edges(data=True):
             g._g.add_edge(u, v, **edge_attrs)
         return g
+
+    # ── Digital Twin Layer Linking ────────────────────────────────────────────
+    #
+    # These three methods build the cross-layer edges that make this a
+    # true Digital Twin rather than a flat code search engine.
+    # Call them in order after the source graph is built:
+    #   1. link_dwarf()      — connects source nodes to binary addresses
+    #   2. link_kallsyms()   — connects binary addresses to live addresses
+    #   3. link_struct_layouts() — annotates struct edges with byte offsets
+
+    def link_dwarf(self, dwarf_bridge, verbose: bool = True) -> dict[str, int]:
+        """
+        Layer 1→2: Connect source CodeNodes to their compiled BinarySymbols.
+
+        For each function/struct/macro CodeNode in the graph, we look up
+        its symbol name in the DWARF bridge and create a SOURCE_TO_BINARY edge
+        pointing to a new BinarySymbol node.
+
+        The BinarySymbol node carries: addr_start, addr_end, section,
+        source_file (from DWARF, may differ from our AST parse), source_line.
+
+        Returns count of edges created.
+        """
+        from ..dwarf.bridge import BinarySymbol
+
+        if not dwarf_bridge._loaded:
+            dwarf_bridge.load(verbose=verbose)
+
+        edges_created = 0
+        symbols_not_found = 0
+
+        for node_id, attrs in list(self._g.nodes(data=True)):
+            node: CodeNode = attrs["data"]
+            if node.node_type not in ("function", "struct", "union", "enum", "macro"):
+                continue
+
+            # Look up in DWARF
+            binary_syms = dwarf_bridge.symbol_to_addrs(node.symbol_name)
+            if not binary_syms:
+                symbols_not_found += 1
+                continue
+
+            for bsym in binary_syms:
+                # Create a BinarySymbol node in the graph
+                bin_node_id = f"bin::{bsym.name}::{bsym.addr_start_hex}"
+                if bin_node_id not in self._g:
+                    self._g.add_node(bin_node_id, data=bsym, layer=2)
+                    self._symbol_index.setdefault(
+                        f"bin::{bsym.name}", []
+                    ).append(bin_node_id)
+
+                # Create SOURCE_TO_BINARY edge
+                self._g.add_edge(
+                    node_id, bin_node_id,
+                    type=EdgeType.SOURCE_TO_BINARY,
+                    dwarf_addr_start=bsym.addr_start,
+                    dwarf_addr_end=bsym.addr_end,
+                    section=bsym.section,
+                )
+                edges_created += 1
+
+        if verbose:
+            print(f"[graph] DWARF linking: {edges_created} SOURCE_TO_BINARY edges, "
+                  f"{symbols_not_found} symbols not found in DWARF")
+
+        return {"SOURCE_TO_BINARY": edges_created, "not_found": symbols_not_found}
+
+    def link_kallsyms(self, kallsyms_bridge, dwarf_bridge, verbose: bool = True) -> dict[str, int]:
+        """
+        Layer 2→3: Connect BinarySymbol nodes to live /proc/kallsyms addresses.
+
+        Computes the KASLR slide (dwarf_addr → live_addr offset) and creates
+        BINARY_TO_LIVE edges from each BinarySymbol node to a synthetic
+        KallsymNode carrying the live virtual address.
+
+        After this, every source CodeNode has a path:
+          source → SOURCE_TO_BINARY → binary → BINARY_TO_LIVE → live_addr
+
+        Returns counts of edges and the computed KASLR slide.
+        """
+        if not kallsyms_bridge._loaded:
+            kallsyms_bridge.load(verbose=verbose)
+
+        # Compute KASLR slide
+        slide = kallsyms_bridge.kaslr_slide(dwarf_bridge)
+        if slide is None:
+            if verbose:
+                print("[graph] WARNING: Could not compute KASLR slide "
+                      "(need root + DWARF loaded). Skipping live address linking.")
+            return {"BINARY_TO_LIVE": 0, "kaslr_slide": None}
+
+        if verbose:
+            print(f"[graph] KASLR slide: 0x{slide:016x} ({slide:+d})")
+
+        edges_created = 0
+
+        # Walk all binary nodes and create BINARY_TO_LIVE edges
+        for node_id, attrs in list(self._g.nodes(data=True)):
+            if attrs.get("layer") != 2:
+                continue
+
+            bsym = attrs["data"]
+            if not hasattr(bsym, "addr_start"):
+                continue
+
+            live_addr = bsym.addr_start + slide
+
+            # Verify against kallsyms
+            entry = kallsyms_bridge.symbol_entries(bsym.name)
+            verified = any(e.address == live_addr for e in entry)
+
+            live_node_id = f"live::{bsym.name}::0x{live_addr:016x}"
+            if live_node_id not in self._g:
+                self._g.add_node(live_node_id, layer=3, data={
+                    "name": bsym.name,
+                    "live_addr": live_addr,
+                    "live_addr_hex": f"0x{live_addr:016x}",
+                    "verified": verified,
+                })
+
+            self._g.add_edge(
+                node_id, live_node_id,
+                type=EdgeType.BINARY_TO_LIVE,
+                kaslr_slide=slide,
+                live_addr=live_addr,
+                verified=verified,
+            )
+            edges_created += 1
+
+        if verbose:
+            print(f"[graph] Kallsyms linking: {edges_created} BINARY_TO_LIVE edges")
+
+        return {"BINARY_TO_LIVE": edges_created, "kaslr_slide": slide}
+
+    def link_struct_layouts(self, dwarf_bridge, verbose: bool = True) -> dict[str, int]:
+        """
+        Layer 1 enrichment: Annotate struct nodes with DWARF field offsets.
+
+        For each struct/union CodeNode, looks up the StructLayout in DWARF
+        and creates FIELD_TO_OFFSET edges from the struct node to synthetic
+        field nodes. Each edge carries: byte_offset, byte_size, c_type.
+
+        This enables raw memory decoding: given a pointer to any struct,
+        we can read each field without needing drgn's type system.
+        """
+        if not dwarf_bridge._loaded:
+            dwarf_bridge.load(verbose=verbose)
+
+        edges_created = 0
+        structs_linked = 0
+
+        for node_id, attrs in list(self._g.nodes(data=True)):
+            node: CodeNode = attrs["data"]
+            if node.node_type not in ("struct", "union"):
+                continue
+
+            layout = dwarf_bridge.struct_layout(node.symbol_name)
+            if not layout:
+                continue
+
+            structs_linked += 1
+
+            # Store total size on the struct node
+            self._g.nodes[node_id]["sizeof"] = layout.total_size
+
+            for field_name, finfo in layout.fields.items():
+                # Create a synthetic field node
+                field_node_id = f"field::{node.symbol_name}::{field_name}"
+                if field_node_id not in self._g:
+                    self._g.add_node(field_node_id, layer=1, data={
+                        "struct": node.symbol_name,
+                        "field": field_name,
+                        "byte_offset": finfo.byte_offset,
+                        "byte_size": finfo.byte_size,
+                        "c_type": finfo.c_type,
+                    })
+
+                self._g.add_edge(
+                    node_id, field_node_id,
+                    type=EdgeType.FIELD_TO_OFFSET,
+                    byte_offset=finfo.byte_offset,
+                    byte_size=finfo.byte_size,
+                    c_type=finfo.c_type,
+                )
+                edges_created += 1
+
+        if verbose:
+            print(f"[graph] Struct layout linking: {structs_linked} structs, "
+                  f"{edges_created} FIELD_TO_OFFSET edges")
+
+        return {"FIELD_TO_OFFSET": edges_created, "structs_linked": structs_linked}
+
+    def live_address_for(self, symbol_name: str) -> list[int]:
+        """
+        Get all live virtual addresses for a symbol name.
+        Requires link_kallsyms() to have been called.
+
+        Traversal: source_node → SOURCE_TO_BINARY → binary_node
+                                                   → BINARY_TO_LIVE → live_addr
+        """
+        live_addrs = []
+        for source_id in self._symbol_index.get(symbol_name, []):
+            if source_id not in self._g:
+                continue
+            for bin_id in self._g.successors(source_id):
+                edges = self._g.get_edge_data(source_id, bin_id) or {}
+                if not any(e.get("type") == EdgeType.SOURCE_TO_BINARY
+                           for e in edges.values()):
+                    continue
+                for live_id in self._g.successors(bin_id):
+                    live_edges = self._g.get_edge_data(bin_id, live_id) or {}
+                    for e in live_edges.values():
+                        if e.get("type") == EdgeType.BINARY_TO_LIVE:
+                            live_addrs.append(e["live_addr"])
+        return live_addrs
+
+    def struct_field_offset(self, struct_name: str, field_name: str) -> int | None:
+        """
+        Get the byte offset of a field within a struct.
+        Requires link_struct_layouts() to have been called.
+        Returns None if not found.
+        """
+        field_node_id = f"field::{struct_name}::{field_name}"
+        if field_node_id in self._g:
+            node_data = self._g.nodes[field_node_id].get("data", {})
+            return node_data.get("byte_offset")
+        return None
 
     # ── Stats ─────────────────────────────────────────────────────────────────
 

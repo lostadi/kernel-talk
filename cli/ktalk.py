@@ -48,6 +48,7 @@ except ImportError:
 from core.mirror.parser import KernelParser
 from core.mirror.store import KernelStore
 from core.probe.drgn_bridge import DrgnBridge
+from core.probe.kallsyms import KallsymsBridge
 from core.synthesis.synthesizer import KernelSynthesizer
 from tools.xray import XRay
 
@@ -499,6 +500,219 @@ def graph_cmd(ctx, symbol, hops):
         console.print(f"\n[bold]Calls ({len(callees)} functions):[/bold]")
         for c in callees[:10]:
             console.print(f"  [blue]→[/blue] {c.symbol_name} [{c.file_path}:{c.line_start}]")
+
+
+# ─── addr2line ────────────────────────────────────────────────────────────────
+
+@cli.command(name="addr2line")
+@click.argument("addresses", nargs=-1, required=True)
+@click.option("--vmlinux", default=None, envvar="KTALK_VMLINUX",
+              help="Path to vmlinux with DWARF debug info.")
+@click.option("--no-cache", is_flag=True, help="Re-parse DWARF (ignore cache).")
+@click.pass_context
+def addr2line_cmd(ctx, addresses, vmlinux, no_cache):
+    """
+    Map virtual kernel address(es) to C source lines.
+
+    The full Digital Twin reverse traversal:
+      address → kallsyms (symbol name) → DWARF (function range)
+              → line number program (exact source line)
+              → Mirror CodeNode (static analysis context)
+
+    Examples:
+      ktalk addr2line 0xffffffff811abc04
+      ktalk addr2line ffffffff811abc04 ffffffff81200018
+      ktalk addr2line --vmlinux /boot/vmlinux 0xffffffff811abc04
+    """
+    storage_dir = ctx.obj["storage"]
+
+    # Locate vmlinux
+    vmlinux_candidates = [
+        vmlinux,
+        f"/boot/vmlinux-{__import__('platform').release()}",
+        "/boot/vmlinux",
+        f"/usr/lib/debug/boot/vmlinux-{__import__('platform').release()}",
+        f"/usr/lib/debug/lib/modules/{__import__('platform').release()}/vmlinux",
+        f"/usr/lib/modules/{__import__('platform').release()}/build/vmlinux",
+    ]
+    vmlinux_path = None
+    for candidate in vmlinux_candidates:
+        if candidate and __import__("pathlib").Path(candidate).exists():
+            vmlinux_path = candidate
+            break
+
+    if not vmlinux_path:
+        console.print("[red]vmlinux not found.[/red]")
+        console.print("Specify with --vmlinux or set KTALK_VMLINUX.")
+        console.print("See README § Debug Symbols for installation instructions.")
+        raise click.Abort()
+
+    # Load DWARF
+    from core.dwarf.bridge import DwarfBridge
+    dwarf = DwarfBridge(vmlinux_path, cache_dir=str(__import__("pathlib").Path(storage_dir) / "dwarf"))
+
+    with console.status(f"Loading DWARF from {vmlinux_path} ..."):
+        dwarf.load(verbose=False, use_cache=not no_cache)
+
+    # Load kallsyms (best-effort — requires root)
+    kallsyms = KallsymsBridge()
+    try:
+        kallsyms.load(verbose=False)
+    except Exception:
+        kallsyms = None
+
+    # Load store (optional — for CodeNode cross-reference)
+    store = None
+    try:
+        store = KernelStore.load(storage_dir)
+    except Exception:
+        pass
+
+    xray = XRay(store=store, dwarf=dwarf, kallsyms=kallsyms)
+
+    for addr_str in addresses:
+        result = xray.addr2line(addr_str)
+
+        table = Table(show_header=False, box=None, padding=(0, 1))
+        table.add_column("Key",   style="cyan bold", width=16)
+        table.add_column("Value", style="white")
+
+        table.add_row("Address", result.address_hex)
+
+        if result.line_source_file and result.line_source_line:
+            stmt = " [stmt]" if result.line_is_stmt else ""
+            table.add_row("Source",   f"[bold green]{result.line_source_file}:{result.line_source_line}[/bold green]{stmt}")
+
+        if result.function_name:
+            fn_offset = result.address - int(result.function_range.split(" – ")[0], 16) \
+                        if result.function_range else result.kallsym_offset
+            table.add_row("Function", f"{result.function_name}()+0x{fn_offset:x}")
+            if result.function_range:
+                table.add_row("Range",    result.function_range)
+            if result.dwarf_source_file:
+                table.add_row("Decl",     f"{result.dwarf_source_file}:{result.dwarf_source_line}")
+
+        if result.kallsym_name and result.kallsym_name != result.function_name:
+            table.add_row("Symbol",   f"{result.kallsym_name}+0x{result.kallsym_offset:x}")
+
+        if result.code_node_id:
+            table.add_row("Mirror",   f"[dim]{result.code_node_id}[/dim]")
+
+        console.print(Panel(table, title=f"[bold]addr2line[/bold]: {addr_str}"))
+
+
+# ─── twin ─────────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--vmlinux", default=None, envvar="KTALK_VMLINUX",
+              help="Path to vmlinux with DWARF debug info.")
+@click.option("--no-cache", is_flag=True, help="Re-parse DWARF (ignore cache).")
+@click.pass_context
+def twin(ctx, vmlinux, no_cache):
+    """
+    Build the full Digital Twin: link all four layers.
+
+    Runs after `ktalk index` to connect the Mirror (Layer 1) to compiled
+    binary addresses via DWARF (Layer 2), then to live /proc/kallsyms
+    addresses (Layer 3), and annotates structs with memory layout.
+
+    After this, `ktalk graph <symbol>` shows live virtual addresses,
+    and `ktalk addr2line` can decode any stack trace or oops address.
+
+    Requires: vmlinux with DWARF + (optionally) root for kallsyms addresses.
+    """
+    storage_dir = ctx.obj["storage"]
+
+    # Load store
+    try:
+        store = KernelStore.load(storage_dir)
+    except Exception as e:
+        console.print(f"[red]Failed to load Mirror: {e}[/red]")
+        console.print("Run [bold]ktalk index[/bold] first.")
+        raise click.Abort()
+
+    # Locate vmlinux
+    import platform as _platform
+    vmlinux_candidates = [
+        vmlinux,
+        f"/boot/vmlinux-{_platform.release()}",
+        "/boot/vmlinux",
+        f"/usr/lib/debug/boot/vmlinux-{_platform.release()}",
+        f"/usr/lib/debug/lib/modules/{_platform.release()}/vmlinux",
+        f"/usr/lib/modules/{_platform.release()}/build/vmlinux",
+    ]
+    vmlinux_path = None
+    for candidate in vmlinux_candidates:
+        if candidate and __import__("pathlib").Path(candidate).exists():
+            vmlinux_path = candidate
+            break
+
+    if not vmlinux_path:
+        console.print("[red]vmlinux not found. Cannot build Layer 2 (DWARF).[/red]")
+        console.print("Install debug symbols — see README § Debug Symbols.")
+        raise click.Abort()
+
+    console.print(Panel(
+        f"[bold cyan]Kernel-Talk: Building the Digital Twin[/bold cyan]\n"
+        f"vmlinux:  {vmlinux_path}\n"
+        f"Storage:  {storage_dir}\n\n"
+        f"[dim]Layer 1: Mirror (source graph)  — already loaded\n"
+        f"Layer 2: DWARF (binary addresses) — loading...\n"
+        f"Layer 3: kallsyms (live addrs)    — loading...\n"
+        f"Layer 4: /proc/kcore (memory)     — on-demand via drgn[/dim]",
+        title="[bold]DIGITAL TWIN[/bold]",
+    ))
+
+    from core.dwarf.bridge import DwarfBridge
+    import pathlib
+
+    dwarf = DwarfBridge(
+        vmlinux_path,
+        cache_dir=str(pathlib.Path(storage_dir) / "dwarf")
+    )
+
+    with Progress(SpinnerColumn(), TextColumn("{task.description}"),
+                  TimeElapsedColumn(), console=console) as progress:
+        t = progress.add_task("Parsing DWARF (may take 1–2 min on first run)...", total=None)
+        dwarf.load(verbose=False, use_cache=not no_cache)
+        progress.update(t, description=f"DWARF loaded: {dwarf.stats()['functions']} functions, "
+                                        f"{dwarf.stats()['struct_types']} structs")
+
+    # Layer 2 linking
+    with console.status("Linking source → binary (SOURCE_TO_BINARY edges)..."):
+        r2 = store.graph.link_dwarf(dwarf, verbose=False)
+    console.print(f"  [green]✓[/green] Layer 1→2: {r2['SOURCE_TO_BINARY']} SOURCE_TO_BINARY edges")
+
+    # Layer 2 struct layout
+    with console.status("Linking struct field offsets (FIELD_TO_OFFSET edges)..."):
+        rl = store.graph.link_struct_layouts(dwarf, verbose=False)
+    console.print(f"  [green]✓[/green] Struct layouts: {rl['structs_linked']} structs, "
+                  f"{rl['FIELD_TO_OFFSET']} FIELD_TO_OFFSET edges")
+
+    # Layer 3 (kallsyms — requires root)
+    kallsyms = KallsymsBridge()
+    try:
+        kallsyms.load(verbose=False)
+        if kallsyms.is_available():
+            with console.status("Linking binary → live addresses (BINARY_TO_LIVE edges)..."):
+                r3 = store.graph.link_kallsyms(kallsyms, dwarf, verbose=False)
+            slide = r3.get("kaslr_slide")
+            slide_str = f"0x{slide:016x}" if slide else "unknown"
+            console.print(f"  [green]✓[/green] Layer 2→3: {r3['BINARY_TO_LIVE']} BINARY_TO_LIVE edges "
+                          f"(KASLR slide: {slide_str})")
+        else:
+            console.print("  [yellow]⚠[/yellow]  Layer 3 skipped: /proc/kallsyms addresses not readable "
+                          "(run as root for full Digital Twin)")
+    except Exception as e:
+        console.print(f"  [yellow]⚠[/yellow]  Layer 3 skipped: {e}")
+
+    # Save the enriched graph
+    with console.status("Saving enriched graph..."):
+        store.save_graph()
+
+    console.print(f"\n[bold green]Digital Twin built.[/bold green]")
+    console.print("Use [bold]ktalk graph <symbol>[/bold] to see live addresses.")
+    console.print("Use [bold]ktalk addr2line <hex_addr>[/bold] to decode stack traces.")
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
