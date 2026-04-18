@@ -7,6 +7,8 @@
 #   make synth           — Generate synthetic training triplets
 #   make bm25            — Build BM25 index + enrich triplets with hard negatives
 #   make train           — Fine-tune CodeBERT bi-encoder
+#   make reranker        — Fine-tune cross-encoder reranker (after train)
+#   make ktalk-bin       — Build the native Rust ktalk CLI binary
 #   make pipeline        — Full pipeline: index → synth → bm25 → train
 #   make test            — Run all tests
 #   make eval            — Run retrieval evaluation on gold set
@@ -31,7 +33,7 @@ MAX_SYNTH    ?= 5000
 N_HARD_NEG   ?= 16
 
 # ─────────────────────────────────────────────────────────────────────────────
-.PHONY: all setup rust index synth bm25 train pipeline test eval clean clean-all help
+.PHONY: all setup rust ktalk-bin index synth bm25 train reranker pipeline test eval clean clean-all help
 
 all: help
 
@@ -40,10 +42,12 @@ help:
 	@echo ""
 	@echo "  make setup         Create venv + install Python deps"
 	@echo "  make rust          Build Rust DWARF extension (optional, 20× speedup)"
+	@echo "  make ktalk-bin     Build native Rust ktalk CLI binary"
 	@echo "  make index         Index kernel source into vector store"
 	@echo "  make synth         Generate synthetic training triplets"
 	@echo "  make bm25          Build BM25 index + enrich with hard negatives"
 	@echo "  make train         Fine-tune CodeBERT bi-encoder"
+	@echo "  make reranker      Fine-tune cross-encoder reranker (requires train)"
 	@echo "  make pipeline      Full pipeline (index → synth → bm25 → train)"
 	@echo "  make test          Run all tests"
 	@echo "  make eval          Run retrieval evaluation"
@@ -75,6 +79,14 @@ rust: setup
 	cd rust_ext/dwarf_reader && \
 	  PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 maturin develop --release
 	@echo "[rust] kernel_talk_dwarf_rs installed — DWARF parsing ~20× faster."
+
+# ─── Native Rust ktalk CLI binary ─────────────────────────────────────────────
+ktalk-bin:
+	@command -v cargo >/dev/null 2>&1 || { \
+	  echo "[ktalk-bin] cargo not found. Install Rust from https://rustup.rs"; exit 1; }
+	cd rust_ext/ktalk_cli && cargo build --release
+	@echo "[ktalk-bin] Binary at: rust_ext/ktalk_cli/target/release/ktalk"
+	@echo "[ktalk-bin] Install:   sudo cp rust_ext/ktalk_cli/target/release/ktalk /usr/local/bin/"
 
 # ─── Mirror index ─────────────────────────────────────────────────────────────
 index: setup
@@ -119,6 +131,14 @@ train: $(DATA)/enriched.jsonl
 	  --epochs     $(EPOCHS) \
 	  --batch-size $(BATCH_SIZE)
 
+# ─── Cross-encoder reranker training ──────────────────────────────────────────
+reranker: $(DATA)/enriched.jsonl
+	@mkdir -p $(CKPTS)/reranker
+	$(PYTHON) -m training.train \
+	  --config   training/configs/reranker_v1.yaml \
+	  --triplets $(DATA)/enriched.jsonl \
+	  --output   $(CKPTS)/reranker
+
 # ─── Full pipeline ─────────────────────────────────────────────────────────────
 pipeline: index synth bm25 train
 	@echo "[pipeline] Complete! Checkpoints at $(CKPTS)"
@@ -152,3 +172,4 @@ clean-all: clean
 	rm -rf $(STORAGE)
 	rm -rf $(CKPTS)
 	rm -rf rust_ext/dwarf_reader/target
+	rm -rf rust_ext/ktalk_cli/target

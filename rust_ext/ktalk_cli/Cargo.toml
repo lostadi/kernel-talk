@@ -1,0 +1,41 @@
+[package]
+name = "ktalk"
+version = "0.1.0"
+edition = "2021"
+description = "kernel-talk CLI — native Rust frontend for kernel code search and indexing"
+authors = ["kernel-talk contributors"]
+license = "GPL-2.0-only"
+
+[[bin]]
+name = "ktalk"
+path = "src/main.rs"
+
+[dependencies]
+# CLI argument parsing
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+# Async runtime for HTTP/IPC calls to the Python backend
+tokio = { version = "1", features = ["full"] }
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+# Colored terminal output
+colored = "2"
+# Progress bar
+indicatif = "0.17"
+# Cross-platform path handling
+dirs = "5"
+# Reqwest for local HTTP (when Python backend is a server)
+reqwest = { version = "0.12", features = ["json"], default-features = false, optional = true }
+
+[features]
+default = []
+# Enable HTTP backend mode (ktalk serve + ktalk query-http)
+http = ["reqwest"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
