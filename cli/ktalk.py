@@ -52,6 +52,7 @@ from core.probe.drgn_bridge import DrgnBridge
 from core.probe.kallsyms import KallsymsBridge
 from core.synthesis.synthesizer import KernelSynthesizer
 from tools.xray import XRay
+from cli.mod import mod as mod_group
 
 console = Console()
 
@@ -79,6 +80,10 @@ def cli(ctx: click.Context, storage: str, model: str):
     ctx.ensure_object(dict)
     ctx.obj["storage"] = storage
     ctx.obj["model"]   = model
+
+
+# Register sub-groups at module level so they're available in all invocation modes.
+cli.add_command(mod_group, name="mod")
 
 
 # ─── index ────────────────────────────────────────────────────────────────────
