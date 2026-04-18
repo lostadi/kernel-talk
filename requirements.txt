@@ -17,10 +17,12 @@ click>=8.1.0                 # Command structure
 rich>=13.7.0                 # Terminal formatting
 
 # ─── Layer 2: DWARF Bridge (source ↔ binary address mapping) ──────────────────
-pyelftools>=0.31             # DWARF/ELF parser — for DwarfBridge
+pyelftools>=0.31             # DWARF/ELF parser — fallback if Rust ext not built
 #                            # Parses vmlinux debug info: function addr ranges,
 #                            # struct field offsets, PC→source line tables.
 #                            # Requires vmlinux with CONFIG_DEBUG_INFO=y.
+#                            # Rust extension (rust_ext/dwarf_reader) is ~20× faster:
+#                            #   cd rust_ext/dwarf_reader && maturin develop --release
 
 # ─── Layer 3+4: The Probe (Linux only, optional) ──────────────────────────────
 # drgn                       # Live kernel memory (pip install drgn, Linux only)
@@ -31,3 +33,6 @@ pyelftools>=0.31             # DWARF/ELF parser — for DwarfBridge
 # ollama                     # Local LLM via Ollama (recommended)
 # openai                     # OpenAI or OpenAI-compatible APIs
 # anthropic                  # Anthropic Claude API
+
+# ─── Development / Testing ────────────────────────────────────────────────────
+pytest>=7.0.0                # Test runner

@@ -186,6 +186,15 @@ class KernelStore:
         manually at the end.
         """
         collection = self._get_collection()
+
+        # Deduplicate by ID: inline static functions in headers can appear
+        # multiple times in the same batch if the parser sees the same symbol
+        # twice (e.g., guards that fail to fire on second include).
+        # Keep the last occurrence so the most-recently-parsed text wins.
+        seen: dict[str, CodeNode] = {}
+        for n in nodes:
+            seen[n.id] = n
+        nodes = list(seen.values())
         total = len(nodes)
 
         if verbose:

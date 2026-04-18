@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
-# tree-sitter >= 0.22 API
+# tree-sitter >= 0.25 API — Query.matches() was removed; we use direct tree-walking
 try:
     from tree_sitter import Language, Parser, Node
     import tree_sitter_c as tsc
@@ -100,63 +100,15 @@ class CodeNode:
         }
 
 
-# ─── tree-sitter Queries ───────────────────────────────────────────────────────
-# We define queries once and reuse them. The pattern language is S-expression
-# based — each capture name (@something) becomes a key in the match dict.
-
-_Q_FUNCTIONS = """
-(function_definition
-  declarator: (function_declarator
-    declarator: (identifier) @name)
-  body: (compound_statement) @body) @function
-"""
-
-_Q_STRUCT_DECL = """
-(struct_specifier
-  name: (type_identifier) @name
-  body: (field_declaration_list) @body) @struct
-"""
-
-_Q_UNION_DECL = """
-(union_specifier
-  name: (type_identifier) @name
-  body: (field_declaration_list) @body) @union
-"""
-
-_Q_ENUM_DECL = """
-(enum_specifier
-  name: (type_identifier) @name
-  body: (enumerator_list) @body) @enum
-"""
-
-_Q_INCLUDES = """
-(preproc_include
-  path: _ @path) @include
-"""
-
-_Q_MACROS = """
-(preproc_def
-  name: (identifier) @name
-  value: _ @value) @macro
-"""
-
-# For extracting function *calls* inside a body — used to build CALLS edges
-_Q_CALLS = """
-(call_expression
-  function: (identifier) @callee)
-"""
-
-# For extracting struct references inside a body — used to build USES_STRUCT edges
-_Q_STRUCT_REFS = """
-(type_identifier) @type_name
-"""
-
-
 # ─── Parser ───────────────────────────────────────────────────────────────────
 
 class KernelParser:
     """
     Parses Linux kernel C source files into CodeNode streams.
+
+    We use direct AST tree-walking rather than tree-sitter Query objects.
+    The Query.matches() API was removed in tree-sitter 0.25; tree-walking
+    via Node.children and Node.child_by_field_name() is the stable interface.
 
     Usage:
         parser = KernelParser(kernel_root="/usr/src/linux")
@@ -170,10 +122,10 @@ class KernelParser:
         "/.git/", "/tools/testing/",
     }
 
-    # F-1: frozenset (immutable) — was a mutable set, which is a shared
-    # mutable class attribute that races under parallel parsing.  Any thread
-    # adding to it would mutate the class-level object seen by all instances.
-    # frozenset is hashable, thread-safe, and slightly faster for `in` tests.
+    # Class-level frozenset of well-known kernel struct names (immutable seed).
+    # Each instance extends this into a mutable _known_structs set so that
+    # struct names discovered while parsing a file are registered for later
+    # cross-reference — without mutating the shared class constant.
     CORE_STRUCTS: frozenset[str] = frozenset({
         "task_struct", "mm_struct", "vm_area_struct", "file", "inode",
         "socket", "sk_buff", "net_device", "super_block", "dentry",
@@ -201,16 +153,9 @@ class KernelParser:
         self.kernel_root = Path(kernel_root)
         self.max_bytes = int(max_file_size_mb * 1024 * 1024)
         self._parser = Parser(C_LANGUAGE)
-
-        # Pre-compile queries once — they're expensive to construct
-        self._q_functions   = C_LANGUAGE.query(_Q_FUNCTIONS)
-        self._q_structs     = C_LANGUAGE.query(_Q_STRUCT_DECL)
-        self._q_unions      = C_LANGUAGE.query(_Q_UNION_DECL)
-        self._q_enums       = C_LANGUAGE.query(_Q_ENUM_DECL)
-        self._q_includes    = C_LANGUAGE.query(_Q_INCLUDES)
-        self._q_macros      = C_LANGUAGE.query(_Q_MACROS)
-        self._q_calls       = C_LANGUAGE.query(_Q_CALLS)
-        self._q_struct_refs = C_LANGUAGE.query(_Q_STRUCT_REFS)
+        # Instance-level mutable copy — grows as we discover struct names.
+        # F-1 fix: was a class-level frozenset with .add() calls (AttributeError).
+        self._known_structs: set[str] = set(self.CORE_STRUCTS)
 
     # ── Public Interface ───────────────────────────────────────────────────────
 
@@ -237,10 +182,13 @@ class KernelParser:
         # Extract includes first — they populate file-level metadata
         includes = self._extract_includes(tree.root_node, source_bytes, rel)
 
-        # Extract each entity type
-        nodes.extend(self._extract_functions(tree.root_node, source_bytes, lines, rel))
+        # Structs/unions FIRST: registers names in _known_structs so that
+        # functions parsed later in the same file see the correct struct refs.
         nodes.extend(self._extract_structs(tree.root_node, source_bytes, lines, rel, "struct"))
         nodes.extend(self._extract_structs(tree.root_node, source_bytes, lines, rel, "union"))
+
+        # Functions, enums, macros
+        nodes.extend(self._extract_functions(tree.root_node, source_bytes, lines, rel))
         nodes.extend(self._extract_enums(tree.root_node, source_bytes, lines, rel))
         nodes.extend(self._extract_macros(tree.root_node, source_bytes, lines, rel))
 
@@ -275,7 +223,46 @@ class KernelParser:
             if path.suffix in extensions and path.is_file():
                 yield from self.parse_file(path)
 
-    # ── Private Extraction Methods ─────────────────────────────────────────────
+    # ── Private Tree-Walking Helpers ───────────────────────────────────────────
+
+    def _find_all(self, root: Node, node_type: str) -> list[Node]:
+        """
+        Iteratively find all descendant nodes of the given type.
+        Uses an explicit stack to avoid Python recursion limits on deep trees.
+        Returns nodes in document order (left-to-right, depth-first).
+        """
+        results: list[Node] = []
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.type == node_type:
+                results.append(node)
+            # Push children in reverse so left-most child is processed first
+            for child in reversed(node.children):
+                stack.append(child)
+        return results
+
+    def _function_name_from_decl(
+        self, decl: Node
+    ) -> tuple["Node | None", "Node | None"]:
+        """
+        Navigate the declarator subtree to find (function_declarator, identifier).
+
+        Handles multi-level pointer return types:
+          int  schedule(void)    → function_declarator → identifier
+          int *kmalloc(size_t)   → pointer_declarator  → function_declarator → identifier
+          int **alloc(void)      → pointer_declarator  → pointer_declarator  → function_declarator → identifier
+        """
+        node = decl
+        # Unwrap any pointer_declarator layers (multiple for **foo())
+        while node is not None and node.type == "pointer_declarator":
+            node = node.child_by_field_name("declarator")
+        if node is None or node.type != "function_declarator":
+            return None, None
+        name_node = node.child_by_field_name("declarator")
+        if name_node is None or name_node.type != "identifier":
+            return None, None
+        return node, name_node
 
     def _node_text(self, node: Node, source: bytes) -> str:
         return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
@@ -300,51 +287,45 @@ class KernelParser:
                 break
         return "\n".join(comment_lines).strip()
 
+    # ── Private Extraction Methods ─────────────────────────────────────────────
+
     def _extract_calls(self, body_node: Node, source: bytes) -> list[str]:
-        """Extract all function calls from a body node."""
-        matches = self._q_calls.matches(body_node)
-        calls = set()
-        for _, capture in matches:
-            for nodes in capture.values():
-                for n in (nodes if isinstance(nodes, list) else [nodes]):
-                    name = self._node_text(n, source)
-                    if name and not name.startswith("__"):  # skip internal builtins
-                        calls.add(name)
+        """Extract direct function call identifiers from a body node."""
+        calls: set[str] = set()
+        for call_node in self._find_all(body_node, "call_expression"):
+            fn_child = call_node.child_by_field_name("function")
+            if fn_child and fn_child.type == "identifier":
+                name = self._node_text(fn_child, source)
+                if name and not name.startswith("__"):
+                    calls.add(name)
         return sorted(calls)
 
-    def _extract_struct_refs(self, body_node: Node, source: bytes) -> list[str]:
-        """Extract struct type references from a node body."""
-        matches = self._q_struct_refs.matches(body_node)
-        refs = set()
-        for _, capture in matches:
-            for nodes in capture.values():
-                for n in (nodes if isinstance(nodes, list) else [nodes]):
-                    name = self._node_text(n, source)
-                    if name in self.CORE_STRUCTS:
-                        refs.add(name)
+    def _extract_struct_refs(self, node: Node, source: bytes) -> list[str]:
+        """Extract struct/union type names referenced within a node."""
+        refs: set[str] = set()
+        for type_node in self._find_all(node, "type_identifier"):
+            name = self._node_text(type_node, source)
+            if name in self._known_structs:
+                refs.add(name)
         return sorted(refs)
 
     def _extract_functions(
         self, root: Node, source: bytes, lines: list[str], rel_path: str
     ) -> list[CodeNode]:
         nodes = []
-        matches = self._q_functions.matches(root)
-        for _, capture in matches:
-            fn_nodes  = capture.get("function", [])
-            name_nodes = capture.get("name", [])
-            body_nodes = capture.get("body", [])
-
-            fn_node   = fn_nodes[0]   if isinstance(fn_nodes, list)   else fn_nodes
-            name_node = name_nodes[0] if isinstance(name_nodes, list) else name_nodes
-            body_node = body_nodes[0] if isinstance(body_nodes, list) else body_nodes
-
-            if fn_node is None or name_node is None:
+        for fn_node in self._find_all(root, "function_definition"):
+            decl = fn_node.child_by_field_name("declarator")
+            if decl is None:
+                continue
+            _fn_decl, name_node = self._function_name_from_decl(decl)
+            if name_node is None:
                 continue
 
-            symbol = self._node_text(name_node, source)
-            code   = self._node_text(fn_node, source)
-            doc    = self._preceding_comment(fn_node, lines)
-            calls  = self._extract_calls(body_node, source) if body_node else []
+            body_node = fn_node.child_by_field_name("body")
+            symbol      = self._node_text(name_node, source)
+            code        = self._node_text(fn_node, source)
+            doc         = self._preceding_comment(fn_node, lines)
+            calls       = self._extract_calls(body_node, source) if body_node else []
             struct_refs = self._extract_struct_refs(fn_node, source)
 
             nodes.append(CodeNode(
@@ -364,34 +345,29 @@ class KernelParser:
     def _extract_structs(
         self, root: Node, source: bytes, lines: list[str], rel_path: str, kind: str
     ) -> list[CodeNode]:
-        query = self._q_structs if kind == "struct" else self._q_unions
+        ts_type = "struct_specifier" if kind == "struct" else "union_specifier"
         nodes = []
-        matches = query.matches(root)
-        for _, capture in matches:
-            parent_key = kind  # "struct" or "union"
-            parent_nodes = capture.get(parent_key, [])
-            name_nodes   = capture.get("name", [])
-
-            parent = parent_nodes[0] if isinstance(parent_nodes, list) else parent_nodes
-            name_n = name_nodes[0]   if isinstance(name_nodes, list)   else name_nodes
-
-            if parent is None or name_n is None:
+        for spec_node in self._find_all(root, ts_type):
+            name_node = spec_node.child_by_field_name("name")
+            body_node = spec_node.child_by_field_name("body")
+            # Skip forward declarations and parameter usages (no body)
+            if name_node is None or body_node is None:
                 continue
 
-            symbol = self._node_text(name_n, source)
-            code   = self._node_text(parent, source)
-            doc    = self._preceding_comment(parent, lines)
+            symbol = self._node_text(name_node, source)
+            code   = self._node_text(spec_node, source)
+            doc    = self._preceding_comment(spec_node, lines)
 
-            # Register new struct names for future cross-referencing
-            self.CORE_STRUCTS.add(symbol)
+            # Register this struct name for cross-reference in later functions
+            self._known_structs.add(symbol)
 
             nodes.append(CodeNode(
                 id=f"{rel_path}::{symbol}",
                 node_type=kind,
                 symbol_name=symbol,
                 file_path=rel_path,
-                line_start=parent.start_point[0] + 1,
-                line_end=parent.end_point[0] + 1,
+                line_start=spec_node.start_point[0] + 1,
+                line_end=spec_node.end_point[0] + 1,
                 code=code,
                 docstring=doc,
             ))
@@ -401,28 +377,23 @@ class KernelParser:
         self, root: Node, source: bytes, lines: list[str], rel_path: str
     ) -> list[CodeNode]:
         nodes = []
-        matches = self._q_enums.matches(root)
-        for _, capture in matches:
-            enum_nodes = capture.get("enum", [])
-            name_nodes = capture.get("name", [])
-
-            enum_n = enum_nodes[0] if isinstance(enum_nodes, list) else enum_nodes
-            name_n = name_nodes[0] if isinstance(name_nodes, list) else name_nodes
-
-            if enum_n is None or name_n is None:
+        for enum_node in self._find_all(root, "enum_specifier"):
+            name_node = enum_node.child_by_field_name("name")
+            body_node = enum_node.child_by_field_name("body")
+            if name_node is None or body_node is None:
                 continue
 
-            symbol = self._node_text(name_n, source)
-            code   = self._node_text(enum_n, source)
-            doc    = self._preceding_comment(enum_n, lines)
+            symbol = self._node_text(name_node, source)
+            code   = self._node_text(enum_node, source)
+            doc    = self._preceding_comment(enum_node, lines)
 
             nodes.append(CodeNode(
                 id=f"{rel_path}::{symbol}",
                 node_type="enum",
                 symbol_name=symbol,
                 file_path=rel_path,
-                line_start=enum_n.start_point[0] + 1,
-                line_end=enum_n.end_point[0] + 1,
+                line_start=enum_node.start_point[0] + 1,
+                line_end=enum_node.end_point[0] + 1,
                 code=code,
                 docstring=doc,
             ))
@@ -433,36 +404,32 @@ class KernelParser:
     ) -> list[CodeNode]:
         """Only extract non-trivial macros (multi-token values)."""
         nodes = []
-        matches = self._q_macros.matches(root)
-        for _, capture in matches:
-            macro_nodes = capture.get("macro", [])
-            name_nodes  = capture.get("name", [])
-            value_nodes = capture.get("value", [])
-
-            macro_n = macro_nodes[0] if isinstance(macro_nodes, list) else macro_nodes
-            name_n  = name_nodes[0]  if isinstance(name_nodes, list)  else name_nodes
-            value_n = value_nodes[0] if isinstance(value_nodes, list) else value_nodes
-
-            if macro_n is None or name_n is None:
+        # preproc_def: simple macros (#define FOO value)
+        # preproc_function_def: function-like macros (#define FOO(x) expr)
+        for ts_type in ("preproc_def", "preproc_function_def"):
+          for macro_node in self._find_all(root, ts_type):
+            name_node  = macro_node.child_by_field_name("name")
+            value_node = macro_node.child_by_field_name("value")
+            if name_node is None:
                 continue
 
-            symbol = self._node_text(name_n, source)
-            value_text = self._node_text(value_n, source) if value_n else ""
+            symbol     = self._node_text(name_node, source)
+            value_text = self._node_text(value_node, source) if value_node else ""
 
-            # Skip trivial macros — numeric constants with short names
+            # Skip trivial macros — numeric constants with short values
             if len(value_text) < 4 and re.match(r"^\d+$", value_text.strip()):
                 continue
 
-            code = self._node_text(macro_n, source)
-            doc  = self._preceding_comment(macro_n, lines)
+            code = self._node_text(macro_node, source)
+            doc  = self._preceding_comment(macro_node, lines)
 
             nodes.append(CodeNode(
                 id=f"{rel_path}::{symbol}",
                 node_type="macro",
                 symbol_name=symbol,
                 file_path=rel_path,
-                line_start=macro_n.start_point[0] + 1,
-                line_end=macro_n.end_point[0] + 1,
+                line_start=macro_node.start_point[0] + 1,
+                line_end=macro_node.end_point[0] + 1,
                 code=code,
                 docstring=doc,
             ))
@@ -472,11 +439,9 @@ class KernelParser:
         self, root: Node, source: bytes, rel_path: str
     ) -> list[str]:
         includes = []
-        matches = self._q_includes.matches(root)
-        for _, capture in matches:
-            path_nodes = capture.get("path", [])
-            path_n = path_nodes[0] if isinstance(path_nodes, list) else path_nodes
-            if path_n:
-                raw = self._node_text(path_n, source).strip('"<>')
+        for inc_node in self._find_all(root, "preproc_include"):
+            path_node = inc_node.child_by_field_name("path")
+            if path_node:
+                raw = self._node_text(path_node, source).strip('"<>')
                 includes.append(raw)
         return includes

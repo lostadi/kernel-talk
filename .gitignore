@@ -1,3 +1,7 @@
+# Rust build artifacts
+rust_ext/*/target/
+rust_ext/**/*.so
+
 # Python
 __pycache__/
 *.py[cod]

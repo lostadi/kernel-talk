@@ -217,9 +217,48 @@ Or use the convenience script which activates the venv and exports defaults:
 source activate.sh
 ```
 
+Or use `make` for the full automated workflow:
+
+```bash
+make setup     # create venv + install deps
+make rust      # build Rust DWARF extension (optional, 20× speedup)
+make pipeline  # index → generate training data → train model
+make test      # run all tests
+```
+
 ---
 
-### 3 · LLM Backend
+### 3 · Rust DWARF Extension (Optional, Recommended)
+
+The `rust_ext/dwarf_reader` crate provides a ~20× speedup for DWARF binary
+parsing (`.parse_dwarf()` path). The Python bridge automatically falls back to
+`pyelftools` if the extension is not built.
+
+**Prerequisites:** [Rust toolchain](https://rustup.rs) and `maturin`.
+
+```bash
+# Install Rust (if not installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+
+# Install maturin (inside the activated venv)
+pip install maturin
+
+# Build and install the extension
+cd rust_ext/dwarf_reader
+PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 maturin develop --release
+cd ../..
+
+# Verify
+python -c "import kernel_talk_dwarf_rs; print(kernel_talk_dwarf_rs.__version__)"
+# → 0.1.0
+```
+
+Or simply run `make rust` after `make setup`.
+
+---
+
+### 4 · LLM Backend
 
 Choose one (or more) of the following.
 
@@ -254,7 +293,7 @@ export KTALK_MODEL=anthropic:claude-3-5-sonnet-20241022
 
 ---
 
-### 4 · Live Kernel Probing — drgn (Linux only)
+### 5 · Live Kernel Probing — drgn (Linux only)
 
 ```bash
 pip install drgn
@@ -337,7 +376,7 @@ sudo emerge sys-kernel/gentoo-kernel-bin   # ships with debug symbols
 
 ---
 
-### 5 · Kernel Source Tree
+### 6 · Kernel Source Tree
 
 You need a kernel source tree to build the Mirror index.
 
@@ -500,7 +539,52 @@ python cli/ktalk.py stats
 
 ---
 
-## Configuration
+### 6 · Training Pipeline (Fine-tune CodeBERT for Kernel Retrieval)
+
+Kernel-Talk can fine-tune a CodeBERT bi-encoder for better kernel-specific
+retrieval. The full pipeline (all steps use `make` for convenience):
+
+```bash
+# Step 1: Generate synthetic training triplets from the Mirror
+python -m training.synth \
+  --storage ~/.kernel-talk/store \
+  --output data/triplets.jsonl \
+  --max-per-strategy 5000
+
+# Step 2: Build a BM25 index for hard-negative mining
+python -m training.bm25 build \
+  --storage ~/.kernel-talk/store \
+  --output data/bm25.pkl
+
+# Step 3: Enrich triplets with BM25 hard negatives
+python -m training.bm25 enrich \
+  --triplets data/triplets.jsonl \
+  --bm25     data/bm25.pkl \
+  --output   data/enriched.jsonl
+
+# Step 4: Fine-tune
+python -m training.train_biencoder \
+  --triplets   data/enriched.jsonl \
+  --storage    ~/.kernel-talk/store \
+  --output     training/checkpoints/ \
+  --epochs     3 \
+  --batch-size 16
+```
+
+Or run the whole pipeline in one shot:
+
+```bash
+make pipeline KERNEL=/usr/src/linux SUBSYS=kernel/sched
+```
+
+> **Note:** When a kernel git repository is available,
+> `python -m training.mine` mines commit messages as natural-language queries
+> (significantly better quality than synthetic data). Use `training/synth.py`
+> when git history is unavailable (e.g., when only kernel headers are present).
+
+---
+
+
 
 All settings can be overridden via environment variables (persistent in `activate.sh`)
 or CLI flags (per-invocation):
@@ -530,14 +614,32 @@ kernel-talk/
 │   │   ├── graph.py       # NetworkX knowledge graph + traversal
 │   │   ├── embedder.py    # CodeBERT embeddings, batched
 │   │   └── store.py       # ChromaDB + graph, unified interface
+│   ├── dwarf/
+│   │   └── bridge.py      # DWARF layer: source↔binary mapping (Rust ext preferred)
 │   ├── probe/
 │   │   └── drgn_bridge.py # Live kernel memory via drgn
 │   └── synthesis/
 │       └── synthesizer.py # Prompt construction + LLM backends
+├── rust_ext/
+│   └── dwarf_reader/      # Rust DWARF parser (~20× faster than pyelftools)
+│       ├── src/lib.rs     # PyO3 extension: parse_dwarf(), get_function_ranges()
+│       ├── Cargo.toml
+│       └── pyproject.toml # maturin build config
+├── training/
+│   ├── synth.py           # Synthetic triplet generator (no git required)
+│   ├── mine.py            # Git commit mining (requires kernel git repo)
+│   ├── bm25.py            # BM25 hard-negative enrichment
+│   ├── dataset.py         # PyTorch dataset for triplets
+│   └── train_biencoder.py # InfoNCE bi-encoder fine-tuning
 ├── tools/
 │   └── xray.py            # Filesystem X-Ray (/sys, /proc → source)
+├── eval/
+│   ├── retrieval_gold.jsonl # 142-entry gold evaluation set
+│   └── retrieval.py        # Evaluation harness (Recall@K, MRR)
+├── tests/                  # pytest test suite (109 tests)
 ├── cli/
 │   └── ktalk.py           # Click CLI with Rich terminal output
+├── Makefile               # Automated workflow (setup/index/train/test)
 ├── activate.sh            # Convenience: venv activation + env defaults
 └── requirements.txt
 ```

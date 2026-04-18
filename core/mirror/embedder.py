@@ -277,8 +277,11 @@ def chunk_text(text: str, max_tokens: int = 450, overlap: int = 50) -> list[str]
             if newline_pos > start:
                 end = newline_pos
         chunks.append(text[start:end])
-        start = end - (overlap * 4)  # overlap in characters
-        if start >= len(text):
-            break
+        if end >= len(text):
+            break  # reached end — stop before the overlap steps backward
+        next_start = end - (overlap * 4)  # overlap in characters
+        if next_start <= start:
+            next_start = end  # guard: always move forward
+        start = next_start
 
     return chunks
