@@ -1,0 +1,248 @@
+"""
+training/eval.py — nDCG@k, Recall@k, MRR evaluation for the reranker.
+
+Evaluates three configurations (spec §6.5):
+  1. Bi-encoder only (baseline)
+  2. Bi-encoder + rule-based rerank (code length, type priors)
+  3. Bi-encoder + learned reranker
+
+Usage:
+    python -m training.eval \\
+        --gold eval/retrieval_gold.jsonl \\
+        --storage ~/.kernel-talk/store \\
+        --reranker training/checkpoints/reranker/best \\
+        --top-k 5 10
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+from pathlib import Path
+from typing import Any
+
+import torch
+
+
+# ── Metrics ───────────────────────────────────────────────────────────────────
+
+def ndcg_at_k(ranked_relevances: list[float], k: int) -> float:
+    """Normalized Discounted Cumulative Gain at k."""
+    dcg = sum(
+        rel / math.log2(rank + 2)
+        for rank, rel in enumerate(ranked_relevances[:k])
+    )
+    ideal = sorted(ranked_relevances, reverse=True)[:k]
+    idcg = sum(rel / math.log2(rank + 2) for rank, rel in enumerate(ideal))
+    return dcg / idcg if idcg > 0 else 0.0
+
+
+def recall_at_k(ranked_ids: list[str], relevant_ids: set[str], k: int) -> float:
+    hits = sum(1 for rid in ranked_ids[:k] if rid in relevant_ids)
+    return hits / max(len(relevant_ids), 1)
+
+
+def mrr(ranked_ids: list[str], relevant_ids: set[str]) -> float:
+    for rank, rid in enumerate(ranked_ids, 1):
+        if rid in relevant_ids:
+            return 1.0 / rank
+    return 0.0
+
+
+# ── Retrieval wrappers ────────────────────────────────────────────────────────
+
+def retrieve_biencoder(
+    query: str, store: Any, top_n: int
+) -> list[tuple[str, float]]:
+    """Return (node_id, score) list from bi-encoder vector search."""
+    results = store.vector_search(query, top_k=top_n)
+    return [(r.node.id, r.score) for r in results]
+
+
+def rerank_rule_based(
+    candidates: list[tuple[str, float]],
+    store: Any,
+    top_k: int,
+) -> list[tuple[str, float]]:
+    """Simple rule-based reranker: prefer functions over macros, prefer longer docstrings."""
+    TYPE_WEIGHTS = {"function": 1.0, "struct": 0.9, "enum": 0.8, "macro": 0.5}
+    scored = []
+    for node_id, base_score in candidates:
+        node = store.graph.get_node(node_id)
+        if node:
+            type_boost = TYPE_WEIGHTS.get(node.node_type, 0.7)
+            doc_boost = min(1.0, len(node.docstring or "") / 200)
+            score = base_score * type_boost * (1 + 0.1 * doc_boost)
+        else:
+            score = base_score
+        scored.append((node_id, score))
+    return sorted(scored, key=lambda x: -x[1])[:top_k]
+
+
+def rerank_learned(
+    query: str,
+    candidates: list[tuple[str, float]],
+    store: Any,
+    reranker: Any,
+    tokenizer: Any,
+    device: torch.device,
+    max_length: int = 512,
+    top_k: int = 10,
+) -> list[tuple[str, float]]:
+    """Rerank candidates using the learned cross-encoder."""
+    from training.models.reranker import tokenize_pair
+
+    node_ids = [nid for nid, _ in candidates]
+    texts = []
+    for node_id in node_ids:
+        node = store.graph.get_node(node_id)
+        texts.append(node.embedding_text() if node else "")
+
+    reranker.eval()
+    with torch.no_grad():
+        enc = tokenize_pair(tokenizer, [query] * len(texts), texts, max_length)
+        enc = {k: v.to(device) for k, v in enc.items()}
+        scores = reranker(**enc).cpu().tolist()
+
+    ranked = sorted(zip(node_ids, scores), key=lambda x: -x[1])
+    return ranked[:top_k]
+
+
+# ── Main evaluation ───────────────────────────────────────────────────────────
+
+def evaluate(
+    gold_path: str,
+    storage_dir: str,
+    reranker_path: str | None,
+    top_ks: list[int],
+    rerank_n: int = 100,
+) -> dict[str, dict[str, float]]:
+    """
+    Evaluate retrieval quality against a gold set.
+
+    Gold file format (JSONL):
+      {"query": "how does fork work", "relevant_ids": ["node-1", "node-2"], ...}
+    """
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from core.mirror.store import KernelStore
+
+    print(f"[eval] Loading store from {storage_dir}", flush=True)
+    store = KernelStore(storage_dir=storage_dir)
+
+    print(f"[eval] Loading gold queries from {gold_path}", flush=True)
+    gold_queries: list[dict] = []
+    with open(gold_path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                gold_queries.append(json.loads(line))
+
+    if not gold_queries:
+        print("[eval] No gold queries found.", file=sys.stderr)
+        return {}
+
+    # Load reranker if given
+    reranker = tokenizer = device = None
+    if reranker_path and Path(reranker_path).exists():
+        from transformers import AutoTokenizer
+        from training.models.reranker import KernelReranker
+        print(f"[eval] Loading reranker from {reranker_path}", flush=True)
+        reranker = KernelReranker.load(reranker_path)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        reranker = reranker.to(device)
+        model_name = (Path(reranker_path) / "model_name.txt").read_text().strip()
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    results: dict[str, dict[str, list[float]]] = {
+        "biencoder": {f"ndcg@{k}": [] for k in top_ks},
+        "rule_rerank": {f"ndcg@{k}": [] for k in top_ks},
+    }
+    if reranker:
+        results["learned_rerank"] = {f"ndcg@{k}": [] for k in top_ks}
+    for setting in results:
+        for k in top_ks:
+            results[setting][f"recall@{k}"] = []
+        results[setting]["mrr"] = []
+
+    for i, gold in enumerate(gold_queries):
+        query = gold["query"]
+        relevant = set(gold.get("relevant_ids", []))
+        if not relevant:
+            continue
+
+        # Bi-encoder baseline
+        bi_results = retrieve_biencoder(query, store, top_n=rerank_n)
+        bi_ids = [nid for nid, _ in bi_results]
+        bi_rels = [1.0 if nid in relevant else 0.0 for nid in bi_ids]
+
+        for k in top_ks:
+            results["biencoder"][f"ndcg@{k}"].append(ndcg_at_k(bi_rels, k))
+            results["biencoder"][f"recall@{k}"].append(recall_at_k(bi_ids, relevant, k))
+        results["biencoder"]["mrr"].append(mrr(bi_ids, relevant))
+
+        # Rule-based reranker
+        rule_results = rerank_rule_based(bi_results, store, top_k=max(top_ks))
+        rule_ids = [nid for nid, _ in rule_results]
+        rule_rels = [1.0 if nid in relevant else 0.0 for nid in rule_ids]
+
+        for k in top_ks:
+            results["rule_rerank"][f"ndcg@{k}"].append(ndcg_at_k(rule_rels, k))
+            results["rule_rerank"][f"recall@{k}"].append(recall_at_k(rule_ids, relevant, k))
+        results["rule_rerank"]["mrr"].append(mrr(rule_ids, relevant))
+
+        # Learned reranker
+        if reranker and tokenizer:
+            lr_results = rerank_learned(
+                query, bi_results, store, reranker, tokenizer, device, top_k=max(top_ks)
+            )
+            lr_ids = [nid for nid, _ in lr_results]
+            lr_rels = [1.0 if nid in relevant else 0.0 for nid in lr_ids]
+            for k in top_ks:
+                results["learned_rerank"][f"ndcg@{k}"].append(ndcg_at_k(lr_rels, k))
+                results["learned_rerank"][f"recall@{k}"].append(recall_at_k(lr_ids, relevant, k))
+            results["learned_rerank"]["mrr"].append(mrr(lr_ids, relevant))
+
+        if (i + 1) % 10 == 0:
+            print(f"[eval] {i+1}/{len(gold_queries)} queries done", flush=True)
+
+    # Average
+    averaged: dict[str, dict[str, float]] = {}
+    for setting, metrics in results.items():
+        averaged[setting] = {
+            metric: (sum(vals) / len(vals) if vals else 0.0)
+            for metric, vals in metrics.items()
+        }
+
+    return averaged
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Evaluate retrieval quality")
+    p.add_argument("--gold",      default="eval/retrieval_gold.jsonl")
+    p.add_argument("--storage",   default=str(Path.home() / ".kernel-talk/store"))
+    p.add_argument("--reranker",  default=None, help="Path to reranker checkpoint dir")
+    p.add_argument("--top-k",     nargs="+", type=int, default=[5, 10])
+    p.add_argument("--rerank-n",  type=int, default=100, help="Bi-encoder candidates to rerank")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = _parse_args()
+    results = evaluate(
+        gold_path=args.gold,
+        storage_dir=args.storage,
+        reranker_path=args.reranker,
+        top_ks=args.top_k,
+        rerank_n=args.rerank_n,
+    )
+    print("\n=== Retrieval Evaluation Results ===")
+    for setting, metrics in results.items():
+        print(f"\n  {setting}:")
+        for metric, value in sorted(metrics.items()):
+            if metric != "total":
+                print(f"    {metric:20s} {value:.4f}")
