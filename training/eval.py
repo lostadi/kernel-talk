@@ -122,8 +122,18 @@ def evaluate(
     """
     Evaluate retrieval quality against a gold set.
 
-    Gold file format (JSONL):
-      {"query": "how does fork work", "relevant_ids": ["node-1", "node-2"], ...}
+    Gold file format (JSONL) — two supported variants:
+
+    New format (preferred):
+      {"query": "how does fork work", "relevant_ids": ["kernel/fork.c::kernel_clone"]}
+
+    Legacy format (auto-converted):
+      {"query": "how does fork work",
+       "expected_symbols": ["kernel_clone"],
+       "expected_files": ["kernel/fork.c"]}
+
+    The legacy format is automatically converted to `relevant_ids` as the
+    cross-product of expected_files × expected_symbols.
     """
     import sys
     sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -138,7 +148,17 @@ def evaluate(
         for line in f:
             line = line.strip()
             if line:
-                gold_queries.append(json.loads(line))
+                entry = json.loads(line)
+                # Support both formats:
+                #   new: {"relevant_ids": [...]}
+                #   old: {"expected_symbols": [...], "expected_files": [...]}
+                if "relevant_ids" not in entry or not entry["relevant_ids"]:
+                    relevant_ids: list[str] = []
+                    for fpath in entry.get("expected_files", []):
+                        for sym in entry.get("expected_symbols", []):
+                            relevant_ids.append(f"{fpath}::{sym}")
+                    entry["relevant_ids"] = relevant_ids
+                gold_queries.append(entry)
 
     if not gold_queries:
         print("[eval] No gold queries found.", file=sys.stderr)
