@@ -69,7 +69,7 @@ except ImportError:
 # ─── Token limits ─────────────────────────────────────────────────────────────
 
 QUERY_MAX_LEN = 128    # Commit messages are short; 128 tokens is always enough
-CODE_MAX_LEN  = 512    # Full BERT limit; most kernel functions fit in this
+CODE_MAX_LEN  = 256    # 256 covers ~95% of kernel functions; 4× faster than 512
 
 
 # ─── Data item ────────────────────────────────────────────────────────────────
