@@ -421,10 +421,10 @@ def train(
             epoch_loss += loss.item()
             n_batches += 1
 
-            if global_step % 100 == 0 and global_step > 0:
+            if global_step % 10 == 0 and global_step > 0:
                 avg_loss = epoch_loss / n_batches
-                print(f"[train] step={global_step} epoch={epoch+1} loss={avg_loss:.4f} "
-                      f"lr={scheduler.get_last_lr()[0]:.2e}")
+                print(f"[train] step={global_step}/{total_steps} epoch={epoch+1} loss={avg_loss:.4f} "
+                      f"lr={scheduler.get_last_lr()[0]:.2e}", flush=True)
 
         # End-of-epoch eval
         recall = eval_recall_at_k(model, val_loader, device, k=10)
@@ -444,7 +444,13 @@ def train(
             best_path = output_path / "best_biencoder"
             model.encoder.save_pretrained(str(best_path))
             tokenizer.save_pretrained(str(best_path))
-            print(f"[train] ✓ New best model saved (recall@10={recall:.4f})")
+            print(f"[train] ✓ New best model saved (recall@10={recall:.4f})", flush=True)
+
+        # Always save epoch checkpoint so we have something regardless of val trend
+        epoch_path = output_path / f"epoch_{epoch+1}"
+        model.encoder.save_pretrained(str(epoch_path))
+        tokenizer.save_pretrained(str(epoch_path))
+        print(f"[train] ✓ Epoch {epoch+1} checkpoint saved → {epoch_path}", flush=True)
 
     # Save final
     final_path = output_path / "final_biencoder"

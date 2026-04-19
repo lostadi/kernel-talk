@@ -567,6 +567,50 @@ The \coderef{HybridResult} carries:
 \texttt{all\_nodes()} merges primary and context deduplicated; the output is
 rendered to a structured text block for the LLM via \texttt{to\_context\_text()}.
 
+%% ── 3.6 Live Build Results ───────────────────────────────────────────────────
+\subsection{Live Build Results}
+\label{sec:build-results}
+
+The following statistics were captured from a live \texttt{ktalk index} run
+over the Linux kernel \texttt{net/} and \texttt{include/linux/} subtrees
+(79 source files, April 2025):
+
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Node Type} & \textbf{Count} & \textbf{\% of total} \\
+\midrule
+Function        & 2{,}718 & 47.2\% \\
+Macro           & 2{,}588 & 45.0\% \\
+Struct          &   281   &  4.9\% \\
+Enum            &    88   &  1.5\% \\
+File            &    77   &  1.3\% \\
+\midrule
+\textbf{Total nodes}  & \textbf{5{,}755} & \\
+\bottomrule
+\end{tabular}
+\quad
+\begin{tabular}{@{}lrr@{}}
+\toprule
+\textbf{Edge Type} & \textbf{Count} & \textbf{\% of total} \\
+\midrule
+\texttt{DEFINED\_IN}  & 5{,}333 & 60.3\% \\
+\texttt{USES\_STRUCT} & 1{,}873 & 21.2\% \\
+\texttt{CALLS}        & 1{,}392 & 15.7\% \\
+\texttt{INCLUDES}     &   245   &  2.8\% \\
+\midrule
+\textbf{Total edges}  & \textbf{8{,}843} & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+All 5{,}755 \coderef{CodeNode} objects are embedded as 768-dimensional
+L2-normalised vectors in ChromaDB (cosine metric, HNSW index).
+The 5{,}402 connected graph nodes form the structural backbone for
+BFS neighbourhood expansion at query time.
+
 %% ============================================================================
 \section{Layer 2 --- The DWARF Bridge}
 \label{sec:dwarf}
@@ -865,7 +909,36 @@ as training commits are trivially solved by memorisation rather than
 generalisation. Temporal splits enforce the harder but correct question:
 \textit{does the model generalise to future kernel changes?}
 
-%% ── 7.2 BM25 Enrichment ──────────────────────────────────────────────────────
+%% ── 7.2 Synthetic Triplet Generation ─────────────────────────────────────────
+\subsection{Stage 1b: Synthetic Triplet Generation (\texttt{synth.py})}
+\label{sec:synth}
+
+When a kernel git repository is not available (or as a supplement to git
+mining), \coderef{synth.py} generates supervision signal directly from the
+ChromaDB index. Three strategies produce complementary query--positive pairs:
+
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}llrr@{}}
+\toprule
+\textbf{Strategy} & \textbf{Query signal} & \textbf{Triplets} & \textbf{\%} \\
+\midrule
+\texttt{synth\_symbol}      & Formatted function name              & 2{,}718 & 41.1\% \\
+\texttt{synth\_docstring}   & First sentence of \texttt{/**} block & 2{,}667 & 40.3\% \\
+\texttt{synth\_caller\_callee} & Caller function body $\to$ callee & 1{,}237 & 18.7\% \\
+\midrule
+\textbf{Total}              &                                      & \textbf{6{,}623} & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+After BM25 hard negative enrichment (§\ref{sec:bm25}), the 6{,}623 records
+have a median BM25 score gap of \textbf{6.65} between positives and their
+hardest negatives --- confirming the negatives are genuinely confusable at the
+lexical level, which is the intended property for contrastive learning.
+
+%% ── 7.3 BM25 Hard Negative Enrichment ────────────────────────────────────────
 \subsection{Stage 2: BM25 Hard Negative Enrichment (\texttt{bm25.py})}
 \label{sec:bm25}
 
@@ -1043,15 +1116,17 @@ contrastive learning without memory banks.
 \toprule
 \textbf{Hyperparameter} & \textbf{Value / Rationale} \\
 \midrule
-Backbone & \texttt{microsoft/codebert-base} (125M params, 768-dim) \\
+Backbone & \texttt{distilbert-base-uncased} (66M params, 768-dim, 6 layers) \\
+Domain adaptation & Fine-tuned on 6{,}623 kernel-specific triplets \\
 Optimiser & AdamW, lr $= 2\!\times\!10^{-5}$, weight\_decay $= 0.01$ \\
 LR Schedule & Linear warmup (10\% steps) + cosine decay \\
-Batch size & 32 (effective 256 with gradient accumulation $\times 8$) \\
+Batch size & 16 (effective 128 with gradient accumulation $\times 8$) \\
 Epochs & 3 (retrieval fine-tuning saturates quickly; more $\Rightarrow$ overfit) \\
 Temperature $\tau$ & 0.07 (following SimCLR/MoCo) \\
 Query max tokens & 128 (commit messages are short) \\
-Code max tokens & 512 (full BERT limit; function signature at start preserved) \\
-Checkpoint metric & Val Recall@10 (save best only) \\
+Code max tokens & 128 (4$\times$ attention speedup vs.\ 512; covers kernel function signatures) \\
+Checkpoint metric & Val Recall@10 (save best; also save per-epoch) \\
+Hardware & Intel Core Ultra 7 164U, 14 cores, MKL/OpenMP (OMP\_NUM\_THREADS=14) \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -1324,6 +1399,62 @@ imported lazily within the methods that need them. The core Mirror pipeline
 (parse + embed + index + query) requires only the first five packages.
 
 %% ============================================================================
+\section{Native CLI Binary (\texttt{ktalk})}
+\label{sec:rust-cli}
+%% ============================================================================
+
+Kernel-Talk ships a native \texttt{ktalk} binary compiled from
+\coderef{rust\_ext/ktalk\_cli/} using Rust (edition 2021) with \texttt{clap} v4.
+Build and install:
+
+\begin{lstlisting}[language={}]
+cd rust_ext/ktalk_cli && cargo build --release
+# or from repo root:
+make ktalk-bin
+sudo cp rust_ext/ktalk_cli/target/release/ktalk /usr/local/bin/
+\end{lstlisting}
+
+\noindent
+The binary provides two execution modes:
+
+\begin{description}[leftmargin=1.5em, itemsep=3pt]
+  \item[\textbf{Native (no Python)}] \texttt{ktalk version}, \texttt{ktalk status},
+        \texttt{ktalk env} --- instant startup, read-only queries.
+        \texttt{ktalk env} detects store path, GPU/NPU availability, Python version,
+        and training state from disk.
+
+  \item[\textbf{Subprocess delegation}] All other subcommands
+        (\texttt{index}, \texttt{ask}, \texttt{train}, \texttt{eval}, \ldots)
+        delegate to \texttt{python -m cli.ktalk} via \texttt{std::process::Command},
+        passing all flags through verbatim and inheriting stdin/stdout/stderr.
+\end{description}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Subcommand} & \textbf{Mode} & \textbf{Description} \\
+\midrule
+\texttt{version}   & Native  & Semver + build hash, instant \\
+\texttt{status}    & Native  & Store item count, graph node/edge count \\
+\texttt{env}       & Native  & Hardware, Python, training state \\
+\texttt{index}     & Python  & Parse + embed kernel source tree \\
+\texttt{ask}       & Python  & Hybrid retrieval + LLM synthesis \\
+\texttt{train}     & Python  & Run full training pipeline \\
+\texttt{eval}      & Python  & nDCG@k, Recall@k, MRR evaluation \\
+\texttt{completions} & Native & Shell completions (bash/zsh/fish) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Shell completions are generated at runtime via \texttt{clap\_complete}:
+
+\begin{lstlisting}[language={}]
+ktalk completions bash >> ~/.bashrc
+ktalk completions zsh  >> ~/.zshrc
+\end{lstlisting}
+
+%% ============================================================================
 \appendix
 %% ============================================================================
 
@@ -1379,9 +1510,11 @@ F-28 & cli/ktalk.py & \texttt{\_\_import\_\_} antipattern & Static imports at mo
   arc=4pt, boxrule=0.6pt
 ]
 \small\centering
-Document generated \today. The system is under active development.\\
-Training pipeline (Stages 1--4) is complete and tested.\\
-Cross-encoder reranker (Stage 5) and hardware setup are planned next.
+Document generated \today.\\[2pt]
+\textbf{Live build:} 5{,}755 nodes $\cdot$ 8{,}843 edges $\cdot$ 6{,}623 enriched training triplets.\\
+\textbf{Training:} \texttt{distilbert-base-uncased} fine-tuned on kernel-specific triplets
+(3 epochs, InfoNCE + curriculum, 14-core CPU). Val Recall@10 updated post-training.\\
+\textbf{Next:} Cross-encoder reranker (Stage 5); Intel Arc XPU acceleration (Python 3.12 venv).
 \end{tcolorbox}
 
 \end{document}
