@@ -209,11 +209,14 @@ class TripletDataset(_DatasetBase):
         for start in range(0, len(id_list), batch_size):
             batch = id_list[start:start + batch_size]
             try:
-                result = self.store._collection.get(
-                    ids=batch, include=["metadatas"]
+                result = self.store._get_collection().get(
+                    ids=batch, include=["metadatas", "documents"]
                 )
-                for node_id, meta in zip(result["ids"], result["metadatas"]):
-                    self._code_cache[node_id] = _code_text(meta)
+                for node_id, meta, doc in zip(
+                    result["ids"], result["metadatas"], result["documents"]
+                ):
+                    code = doc if doc else meta.get("code", "")
+                    self._code_cache[node_id] = code or _code_text(meta)
             except Exception:
                 pass  # Cache miss is OK — we fall back to empty string
 

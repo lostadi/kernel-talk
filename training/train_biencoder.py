@@ -331,11 +331,11 @@ def train(
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        collate_fn=collate_fn, num_workers=2, pin_memory=True,
+        collate_fn=collate_fn, num_workers=0, pin_memory=False,
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
-        collate_fn=collate_fn, num_workers=2,
+        collate_fn=collate_fn, num_workers=0,
     )
 
     # Model

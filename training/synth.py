@@ -113,13 +113,19 @@ def _load_functions(storage: str, min_code_len: int) -> list[dict]:
     """
     import chromadb
 
-    client = chromadb.PersistentClient(path=storage)
+    # KernelStore nests chroma inside a 'chroma/' subdirectory
+    chroma_path = storage
+    import os
+    candidate = os.path.join(storage, "chroma")
+    if os.path.isdir(candidate):
+        chroma_path = candidate
+    client = chromadb.PersistentClient(path=chroma_path)
 
     # The collection name used by KernelStore (see core/mirror/store.py)
     try:
-        collection = client.get_collection("kernel_functions")
+        collection = client.get_collection("kernel_code")
     except Exception:
-        # Fallback: try the first available collection
+        # Fallback: try any available collection
         collections = client.list_collections()
         if not collections:
             raise RuntimeError(
@@ -139,13 +145,16 @@ def _load_functions(storage: str, min_code_len: int) -> list[dict]:
             limit=batch_size,
             offset=offset,
             where={"node_type": "function"},
-            include=["metadatas"],
+            include=["metadatas", "documents"],
         )
         if not result["ids"]:
             break
 
-        for node_id, meta in zip(result["ids"], result["metadatas"]):
-            code = meta.get("code", "")
+        for node_id, meta, doc in zip(
+            result["ids"], result["metadatas"], result["documents"]
+        ):
+            # Code is stored in the ChromaDB document field
+            code = doc if doc else meta.get("code", "")
             if len(code) < min_code_len:
                 continue
             all_nodes.append({

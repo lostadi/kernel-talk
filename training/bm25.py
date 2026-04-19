@@ -153,18 +153,20 @@ class BM25Index:
         docs_added = 0
 
         while True:
-            result = store._collection.get(
+            result = store._get_collection().get(
                 limit=batch_size,
                 offset=offset,
-                include=["metadatas"],
+                include=["metadatas", "documents"],
             )
             if not result["ids"]:
                 break
 
-            for node_id, meta in zip(result["ids"], result["metadatas"]):
+            for node_id, meta, doc in zip(
+                result["ids"], result["metadatas"], result["documents"]
+            ):
+                code = doc if doc else meta.get("code", "")
                 text = (
-                    meta.get("symbol_name", "") + " " +
-                    meta.get("code", "")
+                    meta.get("symbol_name", "") + " " + code
                 )
                 idx._add_document(node_id, text)
                 docs_added += 1
@@ -429,7 +431,6 @@ def enrich_triplets(
     debugging and analysis.
     """
     import random
-    from training.mine import Triplet
 
     all_node_ids = list(bm25_index._id_to_idx.keys())
 
@@ -441,13 +442,26 @@ def enrich_triplets(
         if not line:
             continue
 
-        triplet = Triplet.from_json(line)
-        positive_set = set(triplet.positives)
+        # Support both synth.py output (plain dict) and mine.py Triplet format
+        data = json.loads(line)
+        # Normalize to common schema
+        query = data.get("query", "")
+        positives = data.get("positives", [])
+        if not positives:
+            # Single-positive format from some strategies
+            pos = data.get("positive")
+            if pos:
+                positives = [pos]
+
+        if not query or not positives:
+            continue
+
+        positive_set = set(positives)
 
         # Determine subsystem prefix from first positive's path
         subsystem_prefix = None
-        if triplet.positives:
-            parts = triplet.positives[0].split("::")
+        if positives:
+            parts = positives[0].split("::")
             if parts:
                 path_parts = parts[0].split("/")
                 if len(path_parts) >= 2:
@@ -455,7 +469,7 @@ def enrich_triplets(
 
         # Hard negatives: BM25, optionally within same subsystem
         hard_negs = bm25_index.hard_negatives(
-            query=triplet.query,
+            query=query,
             positive_ids=positive_set,
             k=n_hard,
             subsystem_filter=subsystem_prefix,
@@ -463,7 +477,7 @@ def enrich_triplets(
         # Fallback: widen search if subsystem is too narrow
         if len(hard_negs) < n_hard // 2:
             hard_negs = bm25_index.hard_negatives(
-                query=triplet.query,
+                query=query,
                 positive_ids=positive_set,
                 k=n_hard,
             )
@@ -477,20 +491,18 @@ def enrich_triplets(
         easy_negs = random.sample(easy_pool, min(n_easy, len(easy_pool)))
 
         # Raw difficulty gap: positive BM25 score minus hardest-negative BM25 score.
-        # Large positive = easy (BM25 already separates them).
-        # Near-zero or negative = hard (BM25 is confused).
         gap = bm25_index.difficulty_gap(
-            query=triplet.query,
+            query=query,
             positive_ids=positive_set,
             hard_neg_ids=hard_negs,
         )
 
         records.append({
-            **vars(triplet),
+            **data,
+            "positives":         positives,
             "hard_negatives":    hard_negs,
             "easy_negatives":    easy_negs,
             "hard_negative_gap": gap,
-            # 'difficulty' filled in pass 2
         })
 
         if verbose and i % 1000 == 0:
