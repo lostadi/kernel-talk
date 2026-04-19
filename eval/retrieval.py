@@ -56,8 +56,10 @@ def ndcg_at_k(ranked_relevances: list[float], k: int) -> float:
 
 def recall_at_k(ranked_ids: list[str], relevant_ids: set[str], k: int) -> float:
     """Fraction of relevant documents retrieved in the top-k results."""
+    if not relevant_ids:
+        return 0.0
     hits = sum(1 for rid in ranked_ids[:k] if rid in relevant_ids)
-    return hits / max(len(relevant_ids), 1)
+    return hits / len(relevant_ids)
 
 
 def mrr(ranked_ids: list[str], relevant_ids: set[str]) -> float:

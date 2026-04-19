@@ -123,7 +123,7 @@ Examples:
 python -m pytest tests/ -v
 ```
 
-All 134 unit tests run without a kernel source tree, a ChromaDB store, or ML
+All 163 unit tests run without a kernel source tree, a ChromaDB store, or ML
 dependencies (torch/transformers).
 
 ---
