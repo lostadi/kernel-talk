@@ -54,8 +54,10 @@ htmlcov/
 # ---------------------------------------------------
 *.pkl
 *.jsonl
-training/checkpoints/
 docs/*.pptx
 docs/*.pdf
-data/
 # ---------------------------------------------------
+training/checkpoints/epoch_*
+training/checkpoints/final_biencoder/
+training/checkpoints/best_biencoder/model.safetensors
+*.pkl
