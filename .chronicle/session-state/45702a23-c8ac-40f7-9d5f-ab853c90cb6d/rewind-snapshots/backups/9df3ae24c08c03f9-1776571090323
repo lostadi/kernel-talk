@@ -1,2 +1,0 @@
-{"epoch": 1, "global_step": 49, "train_loss": 3.168021724308808, "val_recall_at_10": 0.4471299093655589}
-{"epoch": 2, "global_step": 98, "train_loss": 3.276762893962376, "val_recall_at_10": 0.47129909365558914}
