@@ -186,7 +186,7 @@ fn cmd_version() -> ExitCode {
         VERSION.yellow()
     );
     println!("  project:  https://github.com/lostadi/kernel-talk");
-    println!("  license:  GPL-2.0-only");
+    println!("  license:  Apache-2.0");
     ExitCode::SUCCESS
 }
 

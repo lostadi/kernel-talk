@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "kernel-talk CLI — native Rust frontend for kernel code search and indexing"
 authors = ["kernel-talk contributors"]
-license = "GPL-2.0-only"
+license = "Apache-2.0"
 
 [[bin]]
 name = "ktalk"
