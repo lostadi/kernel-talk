@@ -2,11 +2,16 @@
 
 > *"Telepathy for the kernel."*
 
+Linux kernel digital twin for AI-assisted program understanding: graph-RAG over
+source, DWARF, kallsyms, and live drgn state.
+
 A Digital Twin for the Linux operating system. Bridges the gap between
 **static source code** (Theory / Logos) and **live runtime memory** (Reality / Eros)
 to answer the question that static analysis alone can never answer:
 
 **Not "what does this code do?" — but "why is my machine doing *this*, right now?"**
+
+**Topics:** `linux-kernel` · `program-analysis` · `graph-rag` · `software-engineering` · `systems` · `debugging` · `drgn` · `dwarf` · `codebert` · `llm`
 
 ---
 
